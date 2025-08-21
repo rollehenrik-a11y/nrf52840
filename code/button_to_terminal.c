@@ -2,73 +2,85 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 
-#define BTN_NODE(idx) DT_ALIAS(sw##idx)
+/* Button aliases on nrf52840dk_nrf52840: sw0..sw3 (SW1..SW4) */
+#define BTN_NODE0 DT_ALIAS(sw0)  /* SW1 */
+#define BTN_NODE1 DT_ALIAS(sw1)  /* SW2 */
+#define BTN_NODE2 DT_ALIAS(sw2)  /* SW3 */
+#define BTN_NODE3 DT_ALIAS(sw3)  /* SW4 */
 
+/* Collect buttons in a tiny table (adjust if your board has fewer) */
 static const struct gpio_dt_spec btns[] = {
-#if DT_NODE_HAS_STATUS(BTN_NODE(0), okay)
-    GPIO_DT_SPEC_GET(BTN_NODE(0), gpios),
-#endif
-#if DT_NODE_HAS_STATUS(BTN_NODE(1), okay)
-    GPIO_DT_SPEC_GET(BTN_NODE(1), gpios),
-#endif
-#if DT_NODE_HAS_STATUS(BTN_NODE(2), okay)
-    GPIO_DT_SPEC_GET(BTN_NODE(2), gpios),
-#endif
-#if DT_NODE_HAS_STATUS(BTN_NODE(3), okay)
-    GPIO_DT_SPEC_GET(BTN_NODE(3), gpios),
-#endif
+    GPIO_DT_SPEC_GET(BTN_NODE0, gpios),
+    GPIO_DT_SPEC_GET(BTN_NODE1, gpios),
+    GPIO_DT_SPEC_GET(BTN_NODE2, gpios),
+    GPIO_DT_SPEC_GET(BTN_NODE3, gpios),
 };
 
-static struct gpio_callback btn_cb_data;
+static struct gpio_callback btn_cb;          /* one shared callback */
+static uint32_t press_count[ARRAY_SIZE(btns)]; /* per-button counters */
+static uint32_t press_total;                 /* total presses */
 
-static void button_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins)
+/* Simple debounce: ignore events within 30 ms for the same button */
+#define DEBOUNCE_MS 30
+static uint32_t last_evt_ms[ARRAY_SIZE(btns)];
+
+static void on_button(const struct device *port,
+                      struct gpio_callback *cb,
+                      uint32_t pins)
 {
+    const uint32_t now = k_uptime_get_32();
+
     for (int i = 0; i < ARRAY_SIZE(btns); i++) {
-        if (pins & BIT(btns[i].pin)) {
-            /* SW1 maps to sw0, SW2 -> sw1, etc. */
-            printk("Pressed: SW%d\n", i + 1);
+        if (port == btns[i].port && (pins & BIT(btns[i].pin))) {
+            /* Active-low buttons: pressed when level == 0 */
+            int level = gpio_pin_get_dt(&btns[i]);
+            if (level == 0) {
+                if ((now - last_evt_ms[i]) < DEBOUNCE_MS) {
+                    return; /* bounce; drop it */
+                }
+                last_evt_ms[i] = now;
+
+                press_count[i]++;
+                press_total++;
+                printk("SW%d pressed  |  count=%u  (total=%u)\n",
+                       i + 1, press_count[i], press_total);
+            }
         }
     }
 }
 
+static void setup_buttons(void)
+{
+    /* Configure pins + enable interrupts on both edges (press/release) */
+    uint32_t mask = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(btns); i++) {
+        __ASSERT(device_is_ready(btns[i].port), "GPIO port not ready");
+
+        /* Input with pull-up (DK buttons are active-low) */
+        int err = gpio_pin_configure_dt(&btns[i], GPIO_INPUT | GPIO_PULL_UP);
+        __ASSERT(err == 0, "cfg failed");
+
+        /* Both edges: we count on press only (level==0 in callback) */
+        err = gpio_pin_interrupt_configure_dt(&btns[i], GPIO_INT_EDGE_BOTH);
+        __ASSERT(err == 0, "irq cfg failed");
+
+        mask |= BIT(btns[i].pin);
+    }
+
+    /* One callback registered to the first button's port is fine on this DK,
+       because all buttons live on the same GPIO port. If you split ports,
+       add a callback per unique port. */
+    gpio_init_callback(&btn_cb, on_button, mask);
+    gpio_add_callback(btns[0].port, &btn_cb);
+}
+
 void main(void)
 {
-    /* Configure each button and enable interrupt */
-    for (int i = 0; i < ARRAY_SIZE(btns); i++) {
-        if (!device_is_ready(btns[i].port)) {
-            printk("GPIO port not ready\n");
-            return;
-        }
-        /* Buttons on Nordic DKs are active-low with pull-up */
-        if (gpio_pin_configure_dt(&btns[i], GPIO_INPUT | GPIO_PULL_UP)) {
-            printk("cfg fail\n"); return;
-        }
-        if (gpio_pin_interrupt_configure_dt(&btns[i], GPIO_INT_EDGE_TO_ACTIVE)) {
-            printk("irq fail\n"); return;
-        }
-    }
+    printk("Ready. Press SW1–SW4 (active-low). Counting presses…\n");
+    setup_buttons();
 
-    /* Register one shared callback for all button pins on the same port(s) */
-    uint32_t pin_mask = 0;
-    for (int i = 0; i < ARRAY_SIZE(btns); i++) {
-        pin_mask |= BIT(btns[i].pin);
-    }
-    gpio_init_callback(&btn_cb_data, button_cb, pin_mask);
-
-    /* Add callback to each involved port (handle split across ports) */
-    /* Simpler: add per unique port */
-    const struct device *seen[4] = {0}; int seen_n = 0;
-    for (int i = 0; i < ARRAY_SIZE(btns); i++) {
-        bool already = false;
-        for (int j = 0; j < seen_n; j++) if (seen[j] == btns[i].port) already = true;
-        if (!already) {
-            gpio_add_callback(btns[i].port, &btn_cb_data);
-            seen[seen_n++] = btns[i].port;
-        }
-    }
-
-    printk("Ready: press SW1–SW4\n");
     while (1) {
-        k_sleep(K_SECONDS(1));
+        k_sleep(K_FOREVER); /* interrupt-driven; nothing to do here */
     }
 }
