@@ -1,0 +1,11 @@
+define device:
+$ ls /dev/ttyACM*
+
+add perms:
+$ sudo usermod -a -G dialout $USER
+
+setup terminal:
+$ screen /dev/ttyACM0 115200
+
+
+
